@@ -14,6 +14,9 @@ internal static class HandlerExecutionRunner
         object job,
         JobContext context,
         TimeSpan cancellationPollInterval,
+        TimeSpan leaseDuration,
+        TimeSpan leaseRenewInterval,
+        TimeProvider timeProvider,
         CancellationToken executionToken,
         CancellationToken stoppingToken)
     {
@@ -26,15 +29,28 @@ internal static class HandlerExecutionRunner
             pollTask = PollCancellationAsync(store, claimed, cancellationPollInterval, linked, stoppingToken);
         }
 
+        Task? renewTask = null;
+        if (leaseRenewInterval > TimeSpan.Zero && leaseDuration > TimeSpan.Zero)
+        {
+            renewTask = PollLeaseRenewalAsync(
+                store,
+                claimed,
+                leaseDuration,
+                leaseRenewInterval,
+                timeProvider,
+                linked,
+                stoppingToken);
+        }
+
         try
         {
             await InvokeHandlerAsync(handler, jobType, job, context, token).ConfigureAwait(false);
         }
         finally
         {
+            linked.Cancel();
             if (pollTask is not null)
             {
-                linked.Cancel();
                 try
                 {
                     await pollTask.ConfigureAwait(false);
@@ -42,6 +58,50 @@ internal static class HandlerExecutionRunner
                 catch (OperationCanceledException)
                 {
                 }
+            }
+
+            if (renewTask is not null)
+            {
+                try
+                {
+                    await renewTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+        }
+    }
+
+    private static async Task PollLeaseRenewalAsync(
+        IJobStore store,
+        ClaimedJob claimed,
+        TimeSpan leaseDuration,
+        TimeSpan interval,
+        TimeProvider timeProvider,
+        CancellationTokenSource executionCts,
+        CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(interval);
+        while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false))
+        {
+            if (executionCts.IsCancellationRequested)
+                return;
+
+            var now = timeProvider.GetUtcNow();
+            var newLeaseExpiresAt = now + leaseDuration;
+            var renewed = await store.RenewAsync(
+                    claimed.JobId,
+                    claimed.AttemptCount,
+                    claimed.LeaseToken,
+                    newLeaseExpiresAt,
+                    stoppingToken)
+                .ConfigureAwait(false);
+
+            if (!renewed)
+            {
+                executionCts.Cancel();
+                return;
             }
         }
     }
@@ -95,11 +155,9 @@ internal static class HandlerExecutionRunner
             throw new InvalidOperationException($"Handler '{handler.GetType().Name}' does not expose HandleAsync.");
 
         var taskObj = method.Invoke(handler, [job, context, cancellationToken]);
-        if (taskObj is ValueTask valueTask)
-            await valueTask.ConfigureAwait(false);
-        else if (taskObj is Task task)
+        if (taskObj is Task task)
             await task.ConfigureAwait(false);
         else
-            throw new InvalidOperationException("HandleAsync must return ValueTask or Task.");
+            throw new InvalidOperationException("HandleAsync must return Task.");
     }
 }

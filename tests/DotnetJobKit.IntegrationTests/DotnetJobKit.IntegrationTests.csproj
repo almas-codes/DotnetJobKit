@@ -24,6 +24,7 @@
     <ProjectReference Include="..\..\src\DotnetJobKit\DotnetJobKit.csproj" />
     <ProjectReference Include="..\..\src\DotnetJobKit.Sqlite\DotnetJobKit.Sqlite.csproj" />
     <ProjectReference Include="..\..\src\DotnetJobKit.EntityFrameworkCore\DotnetJobKit.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="..\..\src\DotnetJobKit.MySql\DotnetJobKit.MySql.csproj" />
   </ItemGroup>
 
 </Project>

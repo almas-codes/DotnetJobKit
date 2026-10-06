@@ -37,5 +37,29 @@ public interface IJobStore
         DateTimeOffset now,
         CancellationToken cancellationToken);
 
-    Task<int> DeleteTerminalBatchAsync(DateTimeOffset now, int batchSize, CancellationToken cancellationToken);
+    Task<int> DeleteTerminalBatchAsync(
+        DateTimeOffset now,
+        JobRetentionPurge retention,
+        int batchSize,
+        CancellationToken cancellationToken);
+
+    Task<IReadOnlyDictionary<JobState, int>> GetCountsByStateAsync(CancellationToken cancellationToken);
+
+    Task<IReadOnlyList<JobRecord>> ListJobsAsync(
+        JobState? state,
+        string? queue,
+        int limit,
+        CancellationToken cancellationToken);
+
+    Task<bool> RequeueDeadAsync(Guid jobId, DateTimeOffset now, CancellationToken cancellationToken);
+
+    Task<bool> DeleteTerminalJobAsync(Guid jobId, CancellationToken cancellationToken);
+
+    Task<bool> CompleteAsRecurringReadyAsync(
+        Guid jobId,
+        int attemptCount,
+        Guid? leaseToken,
+        DateTimeOffset nextEligibleAt,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
 }

@@ -4,8 +4,14 @@ namespace DotnetJobKit.Runtime;
 
 public sealed class JobWakeSignal : IJobWakeSignal
 {
+    private readonly TimeProvider _timeProvider;
     private readonly object _sync = new();
     private CancellationTokenSource _wakeCts = new();
+
+    public JobWakeSignal(TimeProvider timeProvider)
+    {
+        _timeProvider = timeProvider;
+    }
 
     public void Notify()
     {
@@ -19,7 +25,7 @@ public sealed class JobWakeSignal : IJobWakeSignal
     public async Task WaitUntilAsync(DateTimeOffset wakeAt, CancellationToken cancellationToken)
     {
         var wakeToken = GetWakeToken();
-        var delay = wakeAt - DateTimeOffset.UtcNow;
+        var delay = wakeAt - _timeProvider.GetUtcNow();
         if (delay <= TimeSpan.Zero)
             return;
 

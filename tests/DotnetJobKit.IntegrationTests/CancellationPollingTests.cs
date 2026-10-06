@@ -13,7 +13,7 @@ public sealed class SlowJobHandler : IJobHandler<SlowJob>
 {
     public static int Cancelled;
 
-    public async ValueTask HandleAsync(SlowJob job, JobContext context, CancellationToken cancellationToken)
+    public async Task HandleAsync(SlowJob job, JobContext context, CancellationToken cancellationToken)
     {
         try
         {

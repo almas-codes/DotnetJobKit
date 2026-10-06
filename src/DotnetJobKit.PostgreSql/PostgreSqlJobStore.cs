@@ -5,7 +5,7 @@ using Npgsql;
 
 namespace DotnetJobKit.PostgreSql;
 
-public sealed class PostgreSqlJobStore : IJobStore, IDisposable
+public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
 {
     private readonly NpgsqlConnection _connection;
     private readonly PostgreSqlJobStoreOptions _options;
@@ -28,19 +28,45 @@ public sealed class PostgreSqlJobStore : IJobStore, IDisposable
         cmd.ExecuteNonQuery();
         cmd.CommandText = PostgreSqlSchema.CreateDispatchIndex;
         cmd.ExecuteNonQuery();
+        EnsureExtendedColumns(connection);
+    }
+
+    private static void EnsureExtendedColumns(NpgsqlConnection connection)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS recurrence_cron TEXT NULL;
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS continuation_queue TEXT NULL;
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS continuation_contract_name TEXT NULL;
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS continuation_contract_version INT NULL;
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS continuation_payload TEXT NULL;
+            """;
+        cmd.ExecuteNonQuery();
     }
 
     public async Task<Guid> SubmitAsync(JobSubmitRequest request, DateTimeOffset now, CancellationToken cancellationToken)
     {
+        if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
+        {
+            var existing = await TryGetActiveIdempotentJobIdAsync(request.IdempotencyKey, now, cancellationToken).ConfigureAwait(false);
+            if (existing is not null)
+                return existing.Value;
+        }
+
         var jobId = Guid.NewGuid();
+        var expiresAt = request.IdempotencyTtl is { } ttl ? now + ttl : (DateTimeOffset?)null;
         await using var cmd = new NpgsqlCommand(
             """
             INSERT INTO djk_jobs (
                 job_id, queue, contract_name, contract_version, payload, state, eligible_at,
-                attempt_count, max_attempts, cancellation_requested, created_at)
+                attempt_count, max_attempts, cancellation_requested, created_at,
+                idempotency_key, idempotency_expires_at,
+                recurrence_cron, continuation_queue, continuation_contract_name, continuation_contract_version, continuation_payload)
             VALUES (
                 @job_id, @queue, @contract_name, @contract_version, @payload, @state, @eligible_at,
-                0, @max_attempts, false, @created_at);
+                0, @max_attempts, false, @created_at,
+                @idempotency_key, @idempotency_expires_at,
+                @recurrence_cron, @continuation_queue, @continuation_contract_name, @continuation_contract_version, @continuation_payload);
             """,
             _connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
@@ -52,8 +78,41 @@ public sealed class PostgreSqlJobStore : IJobStore, IDisposable
         cmd.Parameters.AddWithValue("eligible_at", request.EligibleAt ?? now);
         cmd.Parameters.AddWithValue("max_attempts", request.MaxAttempts ?? 3);
         cmd.Parameters.AddWithValue("created_at", now);
+        cmd.Parameters.AddWithValue("idempotency_key", (object?)request.IdempotencyKey ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("idempotency_expires_at", (object?)expiresAt ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("recurrence_cron", (object?)request.RecurrenceCron ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("continuation_queue", (object?)request.ContinuationQueue ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("continuation_contract_name", (object?)request.ContinuationContractName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("continuation_contract_version", (object?)request.ContinuationContractVersion ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("continuation_payload", (object?)request.ContinuationPayload ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         return jobId;
+    }
+
+    private async Task<Guid?> TryGetActiveIdempotentJobIdAsync(string key, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var cmd = new NpgsqlCommand(
+            """
+            SELECT job_id, idempotency_expires_at, state FROM djk_jobs
+            WHERE idempotency_key = @key LIMIT 1;
+            """,
+            _connection);
+        cmd.Parameters.AddWithValue("key", key);
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        var state = (JobState)reader.GetInt16(reader.GetOrdinal("state"));
+        if (state is not (JobState.Ready or JobState.Leased))
+            return null;
+
+        var expires = reader.IsDBNull(reader.GetOrdinal("idempotency_expires_at"))
+            ? (DateTimeOffset?)null
+            : reader.GetFieldValue<DateTimeOffset>(reader.GetOrdinal("idempotency_expires_at"));
+        if (expires is not null && expires <= now)
+            return null;
+
+        return reader.GetGuid(reader.GetOrdinal("job_id"));
     }
 
     public async Task<IReadOnlyList<ClaimedJob>> ClaimAsync(
@@ -284,14 +343,26 @@ public sealed class PostgreSqlJobStore : IJobStore, IDisposable
         return value is DateTimeOffset dto ? dto : null;
     }
 
-    public async Task<int> DeleteTerminalBatchAsync(DateTimeOffset now, int batchSize, CancellationToken cancellationToken)
+    public async Task<int> DeleteTerminalBatchAsync(
+        DateTimeOffset now,
+        JobRetentionPurge retention,
+        int batchSize,
+        CancellationToken cancellationToken)
     {
         await using var cmd = new NpgsqlCommand(
             """
             DELETE FROM djk_jobs WHERE job_id IN (
-                SELECT job_id FROM djk_jobs WHERE state IN (2, 3, 4) AND completed_at IS NOT NULL LIMIT @batch);
+                SELECT job_id FROM djk_jobs
+                WHERE completed_at IS NOT NULL AND (
+                    (state = 2 AND completed_at <= @success_cutoff) OR
+                    (state = 3 AND completed_at <= @failed_cutoff) OR
+                    (state = 4 AND completed_at <= @cancel_cutoff))
+                LIMIT @batch);
             """,
             _connection);
+        cmd.Parameters.AddWithValue("success_cutoff", now - retention.SucceededRetention);
+        cmd.Parameters.AddWithValue("failed_cutoff", now - retention.FailedRetention);
+        cmd.Parameters.AddWithValue("cancel_cutoff", now - retention.CancelledRetention);
         cmd.Parameters.AddWithValue("batch", batchSize);
         return await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -311,7 +382,32 @@ public sealed class PostgreSqlJobStore : IJobStore, IDisposable
         CreatedAt = reader.GetFieldValue<DateTimeOffset>(reader.GetOrdinal("created_at")),
         CompletedAt = reader.IsDBNull(reader.GetOrdinal("completed_at")) ? null : reader.GetFieldValue<DateTimeOffset>(reader.GetOrdinal("completed_at")),
         LastError = reader.IsDBNull(reader.GetOrdinal("last_error")) ? null : reader.GetString(reader.GetOrdinal("last_error")),
+        IdempotencyKey = TryGetString(reader, "idempotency_key"),
+        IdempotencyExpiresAt = TryGetDateTimeOffset(reader, "idempotency_expires_at"),
+        RecurrenceCron = TryGetString(reader, "recurrence_cron"),
+        ContinuationQueue = TryGetString(reader, "continuation_queue"),
+        ContinuationContractName = TryGetString(reader, "continuation_contract_name"),
+        ContinuationContractVersion = TryGetInt(reader, "continuation_contract_version"),
+        ContinuationPayload = TryGetString(reader, "continuation_payload"),
     };
+
+    private static string? TryGetString(NpgsqlDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    }
+
+    private static int? TryGetInt(NpgsqlDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
+    }
+
+    private static DateTimeOffset? TryGetDateTimeOffset(NpgsqlDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetFieldValue<DateTimeOffset>(ordinal);
+    }
 
     public void Dispose() => _connection.Dispose();
 }

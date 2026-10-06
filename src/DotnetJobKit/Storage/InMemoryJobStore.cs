@@ -26,6 +26,7 @@ public sealed class InMemoryJobStore : IJobStore
             {
                 if (_idempotencyIndex.TryGetValue(request.IdempotencyKey, out var existingId)
                     && _jobs.TryGetValue(existingId, out var existing)
+                    && existing.State is JobState.Ready or JobState.Leased
                     && (existing.IdempotencyExpiresAt is null || existing.IdempotencyExpiresAt > now))
                 {
                     return Task.FromResult(existingId);
@@ -54,6 +55,11 @@ public sealed class InMemoryJobStore : IJobStore
                 LastError = null,
                 IdempotencyKey = request.IdempotencyKey,
                 IdempotencyExpiresAt = expiresAt,
+                RecurrenceCron = request.RecurrenceCron,
+                ContinuationQueue = request.ContinuationQueue,
+                ContinuationContractName = request.ContinuationContractName,
+                ContinuationContractVersion = request.ContinuationContractVersion,
+                ContinuationPayload = request.ContinuationPayload,
             };
 
             _jobs[jobId] = job;
@@ -123,6 +129,11 @@ public sealed class InMemoryJobStore : IJobStore
                     CancellationRequested = job.CancellationRequested,
                     LeaseExpiresAt = leaseExpiresAt,
                     LeaseToken = job.LeaseToken,
+                    RecurrenceCron = job.RecurrenceCron,
+                    ContinuationQueue = job.ContinuationQueue,
+                    ContinuationContractName = job.ContinuationContractName,
+                    ContinuationContractVersion = job.ContinuationContractVersion,
+                    ContinuationPayload = job.ContinuationPayload,
                 });
             }
         }
@@ -301,15 +312,18 @@ public sealed class InMemoryJobStore : IJobStore
         }
     }
 
-    public Task<int> DeleteTerminalBatchAsync(DateTimeOffset now, int batchSize, CancellationToken cancellationToken)
+    public Task<int> DeleteTerminalBatchAsync(
+        DateTimeOffset now,
+        JobRetentionPurge retention,
+        int batchSize,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
         lock (_sync)
         {
             var toDelete = _jobs.Values
-                .Where(j => j.State is JobState.Dead or JobState.Cancelled or JobState.Succeeded)
-                .Where(j => j.CompletedAt is not null)
+                .Where(j => j.CompletedAt is not null && IsExpired(j, now, retention))
                 .Take(batchSize)
                 .Select(j => j.JobId)
                 .ToList();
@@ -322,6 +336,116 @@ public sealed class InMemoryJobStore : IJobStore
 
             return Task.FromResult(toDelete.Count);
         }
+    }
+
+    public Task<IReadOnlyDictionary<JobState, int>> GetCountsByStateAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            var counts = Enum.GetValues<JobState>().ToDictionary(s => s, _ => 0);
+            foreach (var job in _jobs.Values)
+                counts[job.State]++;
+            return Task.FromResult<IReadOnlyDictionary<JobState, int>>(counts);
+        }
+    }
+
+    public Task<IReadOnlyList<JobRecord>> ListJobsAsync(
+        JobState? state,
+        string? queue,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            var query = _jobs.Values.AsEnumerable();
+            if (state is not null)
+                query = query.Where(j => j.State == state);
+            if (!string.IsNullOrWhiteSpace(queue))
+                query = query.Where(j => j.Queue == queue);
+
+            var list = query
+                .OrderByDescending(j => j.CreatedAt)
+                .Take(Math.Max(1, limit))
+                .Select(j => j.ToRecord())
+                .ToList();
+            return Task.FromResult<IReadOnlyList<JobRecord>>(list);
+        }
+    }
+
+    public Task<bool> RequeueDeadAsync(Guid jobId, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            if (!_jobs.TryGetValue(jobId, out var job) || job.State != JobState.Dead)
+                return Task.FromResult(false);
+
+            job.State = JobState.Ready;
+            job.EligibleAt = now;
+            job.AttemptCount = 0;
+            job.CompletedAt = null;
+            job.LastError = null;
+            job.LeaseToken = null;
+            job.CancellationRequested = false;
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<bool> DeleteTerminalJobAsync(Guid jobId, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            if (!_jobs.TryGetValue(jobId, out var job))
+                return Task.FromResult(false);
+            if (job.State is not (JobState.Dead or JobState.Cancelled or JobState.Succeeded))
+                return Task.FromResult(false);
+
+            _jobs.Remove(jobId);
+            RemoveIdempotency(job);
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<bool> CompleteAsRecurringReadyAsync(
+        Guid jobId,
+        int attemptCount,
+        Guid? leaseToken,
+        DateTimeOffset nextEligibleAt,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            if (!_jobs.TryGetValue(jobId, out var job) || !Owns(job, attemptCount, leaseToken))
+                return Task.FromResult(false);
+
+            job.State = JobState.Ready;
+            job.AttemptCount = 0;
+            job.EligibleAt = nextEligibleAt;
+            job.CompletedAt = null;
+            job.LastError = null;
+            job.LeaseToken = null;
+            job.CancellationRequested = false;
+            return Task.FromResult(true);
+        }
+    }
+
+    private static bool IsExpired(MutableJob job, DateTimeOffset now, JobRetentionPurge retention)
+    {
+        if (job.CompletedAt is not { } completed)
+            return false;
+
+        return job.State switch
+        {
+            JobState.Succeeded => completed + retention.SucceededRetention <= now,
+            JobState.Dead => completed + retention.FailedRetention <= now,
+            JobState.Cancelled => completed + retention.CancelledRetention <= now,
+            _ => false,
+        };
     }
 
     private static bool Owns(MutableJob job, int attemptCount, Guid? leaseToken) =>
@@ -362,6 +486,11 @@ public sealed class InMemoryJobStore : IJobStore
         public string? IdempotencyKey { get; init; }
         public DateTimeOffset? IdempotencyExpiresAt { get; init; }
         public Guid? LeaseToken { get; set; }
+        public string? RecurrenceCron { get; init; }
+        public string? ContinuationQueue { get; init; }
+        public string? ContinuationContractName { get; init; }
+        public int? ContinuationContractVersion { get; init; }
+        public string? ContinuationPayload { get; init; }
 
         public JobRecord ToRecord() => new()
         {
@@ -380,6 +509,11 @@ public sealed class InMemoryJobStore : IJobStore
             LastError = LastError,
             IdempotencyKey = IdempotencyKey,
             IdempotencyExpiresAt = IdempotencyExpiresAt,
+            RecurrenceCron = RecurrenceCron,
+            ContinuationQueue = ContinuationQueue,
+            ContinuationContractName = ContinuationContractName,
+            ContinuationContractVersion = ContinuationContractVersion,
+            ContinuationPayload = ContinuationPayload,
         };
     }
 }

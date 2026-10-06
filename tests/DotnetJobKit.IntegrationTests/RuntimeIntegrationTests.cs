@@ -13,10 +13,10 @@ public sealed class PingHandler : IJobHandler<PingJob>
 {
     public static int Completed;
 
-    public ValueTask HandleAsync(PingJob job, JobContext context, CancellationToken cancellationToken)
+    public Task HandleAsync(PingJob job, JobContext context, CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref Completed);
-        return ValueTask.CompletedTask;
+        return Task.CompletedTask;
     }
 }
 

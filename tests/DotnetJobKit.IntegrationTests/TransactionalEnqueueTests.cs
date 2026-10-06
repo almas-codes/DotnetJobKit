@@ -15,8 +15,8 @@ public sealed record TxJob(string Value);
 
 public sealed class TxJobHandler : IJobHandler<TxJob>
 {
-    public ValueTask HandleAsync(TxJob job, JobContext context, CancellationToken cancellationToken) =>
-        ValueTask.CompletedTask;
+    public Task HandleAsync(TxJob job, JobContext context, CancellationToken cancellationToken) =>
+        Task.CompletedTask;
 }
 
 public sealed class TxDbContext(DbContextOptions<TxDbContext> options) : DbContext(options)
@@ -135,5 +135,39 @@ public class TransactionalEnqueueTests
         }
 
         await host.StopAsync();
+    }
+
+    [Fact]
+    public async Task Ef_enqueue_uses_dbcontext_connection_instance()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"djk-tx-conn-{Guid.NewGuid():N}.db");
+
+        var builder = Host.CreateApplicationBuilder();
+        builder.Services.AddDbContext<TxDbContext>(o => o.UseSqlite($"Data Source={dbPath}"));
+        builder.Services.AddDotnetJobKit();
+        builder.Services.AddDotnetJobKitSqlite($"Data Source={dbPath}");
+        builder.Services.AddDotnetJobHandler<TxJob, TxJobHandler>("tests.tx", "default");
+
+        using var host = builder.Build();
+        await using (var scope = host.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TxDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            var sqlite = db.Database.GetDbConnection() as SqliteConnection ?? throw new InvalidOperationException();
+            if (sqlite.State != System.Data.ConnectionState.Open)
+                await sqlite.OpenAsync();
+            SqliteJobStore.EnsureSchema(sqlite);
+        }
+
+        var submitter = host.Services.GetRequiredService<IJobSubmitter>();
+        await using (var scope = host.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TxDbContext>();
+            var connectionBefore = db.Database.GetDbConnection();
+            await using var tx = await db.Database.BeginTransactionAsync();
+            _ = await submitter.EnqueueInTransactionAsync(new TxJob("x"), db, CancellationToken.None);
+            Assert.Same(connectionBefore, db.Database.GetDbConnection());
+            await tx.RollbackAsync();
+        }
     }
 }

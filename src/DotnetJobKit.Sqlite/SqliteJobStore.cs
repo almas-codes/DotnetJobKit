@@ -6,7 +6,7 @@ using Microsoft.Extensions.Options;
 
 namespace DotnetJobKit.Sqlite;
 
-public sealed class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposable, IDisposable
+public sealed partial class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposable, IDisposable
 {
     private readonly SqliteConnection _connection;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -351,18 +351,32 @@ public sealed class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposa
         }
     }
 
-    public async Task<int> DeleteTerminalBatchAsync(DateTimeOffset now, int batchSize, CancellationToken cancellationToken)
+    public async Task<int> DeleteTerminalBatchAsync(
+        DateTimeOffset now,
+        JobRetentionPurge retention,
+        int batchSize,
+        CancellationToken cancellationToken)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            var successCutoff = (now - retention.SucceededRetention).ToString("O");
+            var failedCutoff = (now - retention.FailedRetention).ToString("O");
+            var cancelledCutoff = (now - retention.CancelledRetention).ToString("O");
+
             await using var cmd = _connection.CreateCommand();
             cmd.CommandText = """
                 DELETE FROM Jobs WHERE JobId IN (
                     SELECT JobId FROM Jobs
-                    WHERE State IN (2, 3, 4) AND CompletedAt IS NOT NULL
+                    WHERE CompletedAt IS NOT NULL AND (
+                        (State = 2 AND CompletedAt <= $successCutoff) OR
+                        (State = 3 AND CompletedAt <= $failedCutoff) OR
+                        (State = 4 AND CompletedAt <= $cancelCutoff))
                     LIMIT $batchSize);
                 """;
+            cmd.Parameters.AddWithValue("$successCutoff", successCutoff);
+            cmd.Parameters.AddWithValue("$failedCutoff", failedCutoff);
+            cmd.Parameters.AddWithValue("$cancelCutoff", cancelledCutoff);
             cmd.Parameters.AddWithValue("$batchSize", batchSize);
             return await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -406,11 +420,13 @@ public sealed class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposa
                 INSERT INTO Jobs (
                     JobId, Queue, ContractName, ContractVersion, Payload, State, EligibleAt,
                     AttemptCount, MaxAttempts, CancellationRequested, CreatedAt, CompletedAt, LastError,
-                    IdempotencyKey, IdempotencyExpiresAt, LeaseToken)
+                    IdempotencyKey, IdempotencyExpiresAt, LeaseToken,
+                    RecurrenceCron, ContinuationQueue, ContinuationContractName, ContinuationContractVersion, ContinuationPayload)
                 VALUES (
                     $jobId, $queue, $contractName, $contractVersion, $payload, $state, $eligibleAt,
                     $attemptCount, $maxAttempts, $cancellationRequested, $createdAt, NULL, NULL,
-                    $idempotencyKey, $idempotencyExpiresAt, NULL);
+                    $idempotencyKey, $idempotencyExpiresAt, NULL,
+                    $recurrenceCron, $continuationQueue, $continuationContractName, $continuationContractVersion, $continuationPayload);
                 """;
             BindSubmit(cmd, jobId, request, eligibleAt, maxAttempts, now, expiresAt);
             await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -459,6 +475,23 @@ public sealed class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposa
             cmd.CommandText = "ALTER TABLE Jobs ADD COLUMN LeaseToken TEXT NULL;";
             cmd.ExecuteNonQuery();
         }
+
+        EnsureOptionalColumn(connection, "RecurrenceCron", "TEXT NULL");
+        EnsureOptionalColumn(connection, "ContinuationQueue", "TEXT NULL");
+        EnsureOptionalColumn(connection, "ContinuationContractName", "TEXT NULL");
+        EnsureOptionalColumn(connection, "ContinuationContractVersion", "INTEGER NULL");
+        EnsureOptionalColumn(connection, "ContinuationPayload", "TEXT NULL");
+    }
+
+    private static void EnsureOptionalColumn(SqliteConnection connection, string name, string definition)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('Jobs') WHERE name = '{name}';";
+        if (Convert.ToInt64(cmd.ExecuteScalar()) > 0)
+            return;
+
+        cmd.CommandText = $"ALTER TABLE Jobs ADD COLUMN {name} {definition};";
+        cmd.ExecuteNonQuery();
     }
 
     private static void BindSubmit(
@@ -486,6 +519,11 @@ public sealed class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposa
             cmd,
             "$idempotencyExpiresAt",
             idempotencyExpiresAt is null ? DBNull.Value : idempotencyExpiresAt.Value.ToString("O"));
+        AddParam(cmd, "$recurrenceCron", (object?)request.RecurrenceCron ?? DBNull.Value);
+        AddParam(cmd, "$continuationQueue", (object?)request.ContinuationQueue ?? DBNull.Value);
+        AddParam(cmd, "$continuationContractName", (object?)request.ContinuationContractName ?? DBNull.Value);
+        AddParam(cmd, "$continuationContractVersion", (object?)request.ContinuationContractVersion ?? DBNull.Value);
+        AddParam(cmd, "$continuationPayload", (object?)request.ContinuationPayload ?? DBNull.Value);
     }
 
     private static void AddParam(DbCommand cmd, string name, object value)
@@ -508,7 +546,7 @@ public sealed class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposa
             cmd.Transaction = transaction;
 
         cmd.CommandText = """
-            SELECT JobId, IdempotencyExpiresAt FROM Jobs WHERE IdempotencyKey = $key LIMIT 1;
+            SELECT JobId, IdempotencyExpiresAt, State FROM Jobs WHERE IdempotencyKey = $key LIMIT 1;
             """;
         AddParam(cmd, "$key", key);
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -516,6 +554,9 @@ public sealed class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposa
             return null;
 
         var expiresRaw = reader.IsDBNull(1) ? null : reader.GetString(1);
+        var state = (JobState)reader.GetInt32(2);
+        if (state is not (JobState.Ready or JobState.Leased))
+            return null;
         if (expiresRaw is not null && DateTimeOffset.Parse(expiresRaw) <= now)
             return null;
 
@@ -549,7 +590,24 @@ public sealed class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyncDisposa
         IdempotencyExpiresAt = reader.IsDBNull(reader.GetOrdinal("IdempotencyExpiresAt"))
             ? null
             : DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("IdempotencyExpiresAt"))),
+        RecurrenceCron = TryGetString(reader, "RecurrenceCron"),
+        ContinuationQueue = TryGetString(reader, "ContinuationQueue"),
+        ContinuationContractName = TryGetString(reader, "ContinuationContractName"),
+        ContinuationContractVersion = TryGetInt(reader, "ContinuationContractVersion"),
+        ContinuationPayload = TryGetString(reader, "ContinuationPayload"),
     };
+
+    private static string? TryGetString(SqliteDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    }
+
+    private static int? TryGetInt(SqliteDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
+    }
 
     public ValueTask DisposeAsync()
     {

@@ -10,7 +10,7 @@
 
 ### **The Lightweight, High-Performance Background Job Runtime for Modern .NET**
 
-*Durable, transaction-safe background services and task processing for ASP.NET Core — without the overhead, database locks, or commercial licensing of Hangfire and Quartz.NET.*
+*Durable, transaction-safe background services and task processing for ASP.NET Core — a lightweight alternative when you do not need a full job dashboard product.*
 
 [Quick Start](#-quick-start-in-60-seconds) • [Why DotnetJobKit?](#-why-dotnetjobkit-vs-hangfire-vs-quartznet) • [Core Features](#-key-features) • [Transactional Enqueue](#-transactional-enqueue-outbox-pattern) • [Benchmarks](#-performance--benchmarks) • [Architecture](#-how-it-works) • [Documentation](docs/)
 
@@ -23,12 +23,12 @@
 **DotnetJobKit** is a fast, resilient, and minimal background task engine designed specifically for modern .NET (`.NET 8`, `.NET 9`, and `.NET 10`).
 
 If you have ever built background workers in C#, you have likely faced the classic dilemma:
-- **`System.Threading.Channels` or `BackgroundService`**: Super fast, but **ephemeral**. If your server or container restarts, all enqueued tasks in memory are permanently lost.
-- **Hangfire**: Durable, but brings a heavy footprint, reflection-heavy expression trees, complex schema migrations, polling overhead, and expensive commercial licenses for core enterprise needs.
-- **Quartz.NET**: Reliable, but carries decades of Java-era legacy baggage, verbose XML/DB triggers, and clumsy state management.
+- **`System.Threading.Channels` or `BackgroundService`**: Super fast, but **ephemeral**. If your server or container restarts, in-memory work is lost unless you add persistence yourself.
+- **Hangfire**: Mature and feature-rich (dashboard, recurring jobs UI, large ecosystem). Heavier footprint and different execution model (expression-based jobs).
+- **Quartz.NET**: Mature scheduler-oriented engine (triggers, calendars, clustering). Strong fit when scheduling is the primary problem.
 
-**DotnetJobKit bridges the gap:**
-It gives you **fully durable ACID database persistence**, **atomic job claiming**, **transactional enqueueing (Outbox Pattern)**, and **instant wake-up signals**, all wrapped in a clean, idiomatic modern .NET API with **zero bloat**.
+**DotnetJobKit targets a narrower slice:**
+**durable rows + atomic claim + handler outside the DB transaction + optional transactional enqueue**, with a small dependency surface and contract-based job payloads.
 
 ---
 
@@ -39,11 +39,11 @@ It gives you **fully durable ACID database persistence**, **atomic job claiming*
 | **Durability** | ✅ Database-backed (ACID) | ✅ Database-backed | ✅ Database-backed | ❌ In-memory only (lost on crash) |
 | **Dependency Footprint** | 🪶 Ultra-lightweight (Zero bloat) | 📦 Heavy (multiple assemblies) | 📦 Heavy (legacy hierarchy) | 🪶 Zero |
 | **License** | 🟢 **100% Free & Open-Source (MIT)** | 🟡 Paid commercial tiers | 🟢 Free (Apache 2.0) | 🟢 Free |
-| **Concurrency Claiming** | ⚡ `SKIP LOCKED` / Atomic Fencing | ⚠️ Polling table locks | ⚠️ Clustered DB locks | ⚡ Local queue |
-| **Transactional Enqueue (Outbox)** | ✅ Native EF Core Transaction support | ⚠️ Separate storage/extension | ❌ Complex setup | ❌ Not durable |
-| **Worker Wake-Up** | 🔔 Instant In-Memory Signal + Timer | ⏱️ Constant DB Polling | ⏱️ Timer polling | 🔔 In-memory channel |
+| **Concurrency Claiming** | ⚡ `SKIP LOCKED` (PostgreSQL) / lease fencing | ✅ DB-backed workers | ✅ Clustered scheduling | ⚡ In-process queue |
+| **Transactional Enqueue (Outbox)** | ✅ SQLite + EF (same connection/tx) | ✅ Patterns available | ⚠️ App-specific | ❌ Not durable |
+| **Worker Wake-Up** | 🔔 Signal + next-`EligibleAt` sleep | ⏱️ Polling-based dispatch | ⏱️ Trigger polling | 🔔 In-memory channel |
 | **Memory at 10M+ Rows** | 📉 Bounded to `MaxConcurrency` | ⚠️ Risk of large memory spike | ⚠️ Large trigger footprint | ❌ OOM crash risk |
-| **DB Lock Duration** | ⚡ Microsecond claim; handler runs outside DB tx | ⚠️ Long locks during dispatch | ⚠️ Transaction locks | ⚡ N/A |
+| **DB Lock Duration** | ⚡ Short claim tx; handler runs outside DB | Varies by storage/dispatch | Varies by job store | ⚡ N/A |
 | **Contract-Based Jobs** | ✅ Strongly typed payloads | ⚠️ Serialized Method Expressions | ⚠️ `IJob` untyped data map | ✅ C# Types |
 
 ---
@@ -57,7 +57,9 @@ It gives you **fully durable ACID database persistence**, **atomic job claiming*
 - **💀 Dead-Letter Queue & Retries**: Built-in retry limits with exponential delay. Once `MaxAttempts` is exhausted, jobs transition safely to `Dead` for inspection.
 - **🚦 Multi-Queue Partitioning**: Organize workloads into dedicated queues (e.g., `"default"`, `"high-priority"`, `"emails"`, `"reports"`).
 - **🔌 Pluggable Storage Backends**: First-class support for **PostgreSQL**, **SQLite**, **MySQL**, and **In-Memory** (for fast unit testing).
-- **📊 Modern .NET First**: Full async/await with `ValueTask`, structured logging via `Microsoft.Extensions.Logging`, dependency injection, and native `IHostedService` lifecycle management.
+- **📊 Modern .NET First**: Full async/await with `Task`-based handlers, structured logging, dependency injection, and native `IHostedService` lifecycle management.
+- **🔁 Recurring, chaining, idempotency**: Cron-style recurrence (5-field UTC parser), `ContinueWithAsync`, and optional `UniqueKey` deduplication while a job is pending or leased.
+- **📋 Minimal dashboard**: Sample Minimal API includes `/admin` (counts, list, retry/delete dead jobs).
 
 ---
 
@@ -66,7 +68,7 @@ It gives you **fully durable ACID database persistence**, **atomic job claiming*
 | Provider | Best Used For | High-Throughput Mechanism |
 | :--- | :--- | :--- |
 | **PostgreSQL** (`DotnetJobKit.PostgreSql`) | Cloud & Distributed High-Scale Production | `FOR UPDATE SKIP LOCKED` atomic claims + `COPY` binary bulk ingestion (>57,000 jobs/sec) |
-| **SQLite** (`DotnetJobKit.Sqlite`) | Single-Node, Monoliths, Edge Devices, Local Dev | WAL mode (`Write-Ahead Logging`) + indexed dispatch queues |
+| **SQLite** (`DotnetJobKit.Sqlite`) | Single-Node, Monoliths, Edge Devices, Local Dev | WAL + indexed dispatch — **local disk only** ([docs/SQLITE.md](docs/SQLITE.md)) |
 | **MySQL** (`DotnetJobKit.MySql`) | MySQL / MariaDB Production Stacks | Bounded atomic leasing and indexed dispatch |
 | **In-Memory** (`DotnetJobKit`) | Unit & Integration Tests | Thread-safe, non-durable in-memory state engine |
 
@@ -133,7 +135,7 @@ builder.Services.AddDotnetJobKit(options =>
 {
     options.MaxConcurrency = 16;
     options.Queues = ["default", "notifications"];
-    options.Retention.DeleteOnSuccess = true; // Automatically clean up completed rows
+    options.Retention.SucceededRetention = TimeSpan.FromDays(7); // Audit trail; background purge
 });
 
 // 2. Select Storage Provider (e.g. PostgreSQL or SQLite)
@@ -230,7 +232,7 @@ Every job transitions through clear, deterministic states:
               │   └────────────────────────────────┘
               ▼
        ┌──────────────┐
-       │  Succeeded   │ ──► (Deleted if DeleteOnSuccess = true)
+       │  Succeeded   │ ──► (Retained, then purged after SucceededRetention)
        └──────────────┘
 ```
 
@@ -270,7 +272,9 @@ Under an extreme backlog test with **10 Million rows** in PostgreSQL:
 - **Bulk COPY Stream**: 10M rows inserted in ~23 minutes.
 - **Memory Consumption**: Remained steady under 150 MB because DotnetJobKit claims only up to `MaxConcurrency` and **never loads the backlog into RAM**.
 
-*(Detailed benchmark methodology and raw JSON telemetry can be reviewed in [docs/PERFORMANCE.md](docs/PERFORMANCE.md) and [docs/PERFORMANCE-REPORT.md](docs/PERFORMANCE-REPORT.md).)*
+*(PerfRunner numbers are **single-process bulk insert + claim** unless noted. Multi-process SQLite and multi-node scenarios differ — see [docs/SQLITE.md](docs/SQLITE.md) and integration tests.)*
+
+*(Detailed methodology: [docs/PERFORMANCE.md](docs/PERFORMANCE.md), [docs/PERFORMANCE-REPORT.md](docs/PERFORMANCE-REPORT.md).)*
 
 ---
 

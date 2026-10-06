@@ -10,4 +10,9 @@ public sealed class JobSubmitRequest
     public int? MaxAttempts { get; init; }
     public string? IdempotencyKey { get; init; }
     public TimeSpan? IdempotencyTtl { get; init; }
+    public string? RecurrenceCron { get; init; }
+    public string? ContinuationQueue { get; init; }
+    public string? ContinuationContractName { get; init; }
+    public int? ContinuationContractVersion { get; init; }
+    public string? ContinuationPayload { get; init; }
 }

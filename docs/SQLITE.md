@@ -1,23 +1,15 @@
-# SQLite provider
+# SQLite provider notes
 
-V1 durable store for single-node and multi-process experiments.
+## Single-node and local development
 
-## Schema
+SQLite works well for **one machine**, **one writer process** (or coordinated workers with WAL + `busy_timeout`), and **local disk** storage.
 
-Table `Jobs` with partial index `IX_Jobs_Dispatch` on `(Queue, EligibleAt, JobId)` where `State IN (0,1)`.
+## Do not use on network filesystems
 
-## PRAGMAs
+**Do not place the SQLite job database on NFS, SMB/CIFS, or other network-mounted volumes** for production job storage. SQLite relies on POSIX advisory locking and local filesystem semantics; network shares often break locking and can cause `database is locked` errors or corruption under concurrent writers.
 
-- `journal_mode=WAL` (configurable)
-- `busy_timeout` (default 5000 ms)
+Use **PostgreSQL** or **MySQL** when multiple app nodes or workers need durable queues on shared infrastructure.
 
-## Limitations
+## Multi-process claiming
 
-- Not recommended for large distributed production (use future SQL Server/PostgreSQL providers with the same `IJobStore` contract).
-- Cross-process: no durable notify; rely on wake signal in-process + bounded reconciliation + `GetNextEligibleAt`.
-
-## Claim
-
-Short transaction: select one eligible row, conditional update with expected `AttemptCount`, increment attempt, set `Leased` and lease expiry.
-
-Transactional enqueue with caller EF transaction is **not** implemented in V1 for SQLite; requires shared connection — documented as an extension point.
+Concurrent **OS processes** on the same `.db` file contend on SQLite’s single-writer model. Throughput scales differently than PostgreSQL `SKIP LOCKED` across nodes. See `SqliteMultiProcessTests` and `tools/DotnetJobKit.SqliteMultiProcessWorker` for measured multi-process claim rates on your hardware.

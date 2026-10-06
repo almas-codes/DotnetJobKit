@@ -16,10 +16,10 @@ public sealed class ScaleJobHandler : IJobHandler<ScaleJob>
 {
     public static int Completed;
 
-    public ValueTask HandleAsync(ScaleJob job, JobContext context, CancellationToken cancellationToken)
+    public Task HandleAsync(ScaleJob job, JobContext context, CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref Completed);
-        return ValueTask.CompletedTask;
+        return Task.CompletedTask;
     }
 }
 

@@ -1,6 +1,7 @@
 using DotnetJobKit.Abstractions;
 using DotnetJobKit.Configuration;
 using DotnetJobKit.Handlers;
+using DotnetJobKit.Scheduling;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -76,7 +77,18 @@ public sealed class JobRuntimeCoordinator : BackgroundService
 
                 if (now >= nextReconcileAt)
                 {
-                    await _store.DeleteTerminalBatchAsync(now, batchSize: 100, stoppingToken).ConfigureAwait(false);
+                    var retention = new JobRetentionPurge
+                    {
+                        SucceededRetention = _options.Retention.SucceededRetention,
+                        FailedRetention = _options.Retention.FailedRetention,
+                        CancelledRetention = _options.Retention.CancelledRetention,
+                    };
+                    await _store.DeleteTerminalBatchAsync(
+                            now,
+                            retention,
+                            _options.Retention.PurgeBatchSize,
+                            stoppingToken)
+                        .ConfigureAwait(false);
                     nextReconcileAt = now + _options.ReconciliationInterval;
                 }
 
@@ -163,19 +175,22 @@ public sealed class JobRuntimeCoordinator : BackgroundService
                 jobObject,
                 context,
                 _options.CancellationPollInterval,
+                _options.LeaseDuration,
+                _options.LeaseRenewInterval,
+                _timeProvider,
                 executionCts.Token,
                 stoppingToken).ConfigureAwait(false);
 
-            await SettleSuccessAsync(claimed, stoppingToken).ConfigureAwait(false);
+            await SettleSuccessAsync(claimed, CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (executionCts.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
         {
-            await SettleCancelledAsync(claimed, "Execution cancelled or timed out.", stoppingToken).ConfigureAwait(false);
+            await SettleCancelledAsync(claimed, "Execution cancelled or timed out.", CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Job {JobId} ({Contract}) failed on attempt {Attempt}", claimed.JobId, claimed.ContractName, claimed.AttemptCount);
-            await SettleFailureAsync(claimed, ex.Message, stoppingToken).ConfigureAwait(false);
+            await SettleFailureAsync(claimed, ex.Message, CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {
@@ -188,6 +203,23 @@ public sealed class JobRuntimeCoordinator : BackgroundService
     private async Task SettleSuccessAsync(ClaimedJob claimed, CancellationToken cancellationToken)
     {
         var now = _timeProvider.GetUtcNow();
+
+        if (claimed.RecurrenceCron is { Length: > 0 } cron)
+        {
+            var next = CronFiveFieldParser.GetNextOccurrence(cron, now);
+            await _store.CompleteAsRecurringReadyAsync(
+                    claimed.JobId,
+                    claimed.AttemptCount,
+                    claimed.LeaseToken,
+                    next,
+                    now,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            _wakeSignal.Notify();
+            await EnqueueContinuationIfPresentAsync(claimed, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         await _store.SettleAsync(new SettleRequest
         {
             JobId = claimed.JobId,
@@ -195,8 +227,31 @@ public sealed class JobRuntimeCoordinator : BackgroundService
             LeaseToken = claimed.LeaseToken,
             Outcome = SettleOutcome.Succeeded,
             Now = now,
-            DeleteOnSuccess = _options.Retention.DeleteOnSuccess,
+            DeleteOnSuccess = _options.Retention.ShouldDeleteImmediatelyOnSuccess(),
         }, cancellationToken).ConfigureAwait(false);
+
+        await EnqueueContinuationIfPresentAsync(claimed, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task EnqueueContinuationIfPresentAsync(ClaimedJob claimed, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(claimed.ContinuationContractName)
+            || string.IsNullOrWhiteSpace(claimed.ContinuationPayload))
+        {
+            return;
+        }
+
+        var request = new JobSubmitRequest
+        {
+            Queue = claimed.ContinuationQueue ?? claimed.Queue,
+            ContractName = claimed.ContinuationContractName,
+            ContractVersion = claimed.ContinuationContractVersion ?? 1,
+            Payload = claimed.ContinuationPayload,
+            MaxAttempts = _options.DefaultRetry.MaxAttempts,
+        };
+
+        await _store.SubmitAsync(request, _timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
+        _wakeSignal.Notify();
     }
 
     private async Task SettleCancelledAsync(ClaimedJob claimed, string reason, CancellationToken cancellationToken)
@@ -278,7 +333,7 @@ public sealed class JobRuntimeCoordinator : BackgroundService
 
     private async Task WaitForActiveExecutionsAsync(CancellationToken stoppingToken)
     {
-        while (Volatile.Read(ref _activeExecutions) > 0 && !stoppingToken.IsCancellationRequested)
-            await Task.Delay(50, stoppingToken).ConfigureAwait(false);
+        while (Volatile.Read(ref _activeExecutions) > 0)
+            await Task.Delay(50, CancellationToken.None).ConfigureAwait(false);
     }
 }

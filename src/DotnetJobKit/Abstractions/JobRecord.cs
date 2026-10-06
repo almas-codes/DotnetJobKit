@@ -17,4 +17,9 @@ public sealed class JobRecord
     public string? LastError { get; init; }
     public string? IdempotencyKey { get; init; }
     public DateTimeOffset? IdempotencyExpiresAt { get; init; }
+    public string? RecurrenceCron { get; init; }
+    public string? ContinuationQueue { get; init; }
+    public string? ContinuationContractName { get; init; }
+    public int? ContinuationContractVersion { get; init; }
+    public string? ContinuationPayload { get; init; }
 }

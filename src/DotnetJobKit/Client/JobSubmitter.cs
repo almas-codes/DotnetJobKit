@@ -28,21 +28,52 @@ public sealed class JobSubmitter : IJobSubmitter
         _options = options.Value;
     }
 
-    public async Task<Guid> EnqueueAsync<TJob>(TJob job, CancellationToken cancellationToken = default)
+    public Task<Guid> EnqueueAsync<TJob>(TJob job, CancellationToken cancellationToken = default)
+        where TJob : notnull
+        => EnqueueAsync(job, options: null, cancellationToken);
+
+    internal async Task<Guid> EnqueueAsync<TJob>(
+        TJob job,
+        JobEnqueueOptions? options,
+        CancellationToken cancellationToken)
         where TJob : notnull
     {
         var now = _timeProvider.GetUtcNow();
-        return await SubmitCoreAsync(job, now, cancellationToken).ConfigureAwait(false);
+        return await SubmitCoreAsync(job, now, options, continuation: null, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<Guid> ScheduleAsync<TJob>(TJob job, DateTimeOffset eligibleAt, CancellationToken cancellationToken = default)
         where TJob : notnull
     {
         var now = _timeProvider.GetUtcNow();
-        return await SubmitCoreAsync(job, eligibleAt, cancellationToken).ConfigureAwait(false);
+        return await SubmitCoreAsync(job, eligibleAt, options: null, continuation: null, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<Guid> SubmitCoreAsync<TJob>(TJob job, DateTimeOffset eligibleAt, CancellationToken cancellationToken)
+    internal async Task<Guid> ContinueWithAsync<TParent, TNext>(
+        TParent parentJob,
+        TNext continuationJob,
+        CancellationToken cancellationToken)
+        where TParent : notnull
+        where TNext : notnull
+    {
+        var parentReg = _registry.GetByJobType(typeof(TParent));
+        var nextReg = _registry.GetByJobType(typeof(TNext));
+        var continuation = new ContinuationSpec(
+            nextReg.DefaultQueue,
+            nextReg.ContractName,
+            nextReg.ContractVersion,
+            _registry.Serialize(continuationJob));
+
+        var now = _timeProvider.GetUtcNow();
+        return await SubmitCoreAsync(parentJob, now, options: null, continuation, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<Guid> SubmitCoreAsync<TJob>(
+        TJob job,
+        DateTimeOffset eligibleAt,
+        JobEnqueueOptions? options,
+        ContinuationSpec? continuation,
+        CancellationToken cancellationToken)
         where TJob : notnull
     {
         var registration = _registry.GetByJobType(typeof(TJob));
@@ -57,6 +88,13 @@ public sealed class JobSubmitter : IJobSubmitter
             Payload = payload,
             EligibleAt = eligibleAt,
             MaxAttempts = _options.DefaultRetry.MaxAttempts,
+            IdempotencyKey = options?.UniqueKey,
+            IdempotencyTtl = options?.IdempotencyTtl,
+            RecurrenceCron = options?.RecurrenceCron,
+            ContinuationQueue = continuation?.Queue,
+            ContinuationContractName = continuation?.ContractName,
+            ContinuationContractVersion = continuation?.ContractVersion,
+            ContinuationPayload = continuation?.Payload,
         };
 
         var jobId = await _store.SubmitAsync(request, _timeProvider.GetUtcNow(), cancellationToken)
@@ -120,4 +158,6 @@ public sealed class JobSubmitter : IJobSubmitter
             throw new InvalidOperationException(
                 $"Job payload size {byteCount} bytes exceeds limit {_options.PayloadMaxBytes}.");
     }
+
+    private sealed record ContinuationSpec(string Queue, string ContractName, int ContractVersion, string Payload);
 }

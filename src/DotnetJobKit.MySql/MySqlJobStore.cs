@@ -5,7 +5,7 @@ using MySqlConnector;
 
 namespace DotnetJobKit.MySql;
 
-public sealed class MySqlJobStore : IJobStore, IDisposable
+public sealed partial class MySqlJobStore : IJobStore, IDisposable
 {
     private readonly MySqlConnection _connection;
     private readonly MySqlJobStoreOptions _options;
@@ -16,6 +16,11 @@ public sealed class MySqlJobStore : IJobStore, IDisposable
         _connection = new MySqlConnection(_options.ConnectionString);
         _connection.Open();
         EnsureSchema(_connection);
+        using (var iso = _connection.CreateCommand())
+        {
+            iso.CommandText = "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;";
+            iso.ExecuteNonQuery();
+        }
     }
 
     public static void EnsureSchema(MySqlConnection connection)
@@ -23,18 +28,45 @@ public sealed class MySqlJobStore : IJobStore, IDisposable
         using var cmd = connection.CreateCommand();
         cmd.CommandText = MySqlSchema.CreateTable;
         cmd.ExecuteNonQuery();
+        cmd.CommandText = """
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS recurrence_cron VARCHAR(128) NULL;
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS continuation_queue VARCHAR(128) NULL;
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS continuation_contract_name VARCHAR(256) NULL;
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS continuation_contract_version INT NULL;
+            ALTER TABLE djk_jobs ADD COLUMN IF NOT EXISTS continuation_payload LONGTEXT NULL;
+            """;
+        try
+        {
+            cmd.ExecuteNonQuery();
+        }
+        catch (MySqlException)
+        {
+            // Older MySQL without IF NOT EXISTS: ignore if columns already exist.
+        }
     }
 
     public async Task<Guid> SubmitAsync(JobSubmitRequest request, DateTimeOffset now, CancellationToken cancellationToken)
     {
+        if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
+        {
+            var existing = await TryGetActiveIdempotentJobIdAsync(request.IdempotencyKey, now, cancellationToken).ConfigureAwait(false);
+            if (existing is not null)
+                return existing.Value;
+        }
+
         var jobId = Guid.NewGuid();
+        var expiresAt = request.IdempotencyTtl is { } ttl ? now + ttl : (DateTimeOffset?)null;
         await using var cmd = new MySqlCommand(
             """
             INSERT INTO djk_jobs (
                 job_id, queue, contract_name, contract_version, payload, state, eligible_at,
-                attempt_count, max_attempts, cancellation_requested, created_at)
+                attempt_count, max_attempts, cancellation_requested, created_at,
+                idempotency_key, idempotency_expires_at,
+                recurrence_cron, continuation_queue, continuation_contract_name, continuation_contract_version, continuation_payload)
             VALUES (@job_id, @queue, @contract_name, @contract_version, @payload, @state, @eligible_at,
-                0, @max_attempts, 0, @created_at);
+                0, @max_attempts, 0, @created_at,
+                @idempotency_key, @idempotency_expires_at,
+                @recurrence_cron, @continuation_queue, @continuation_contract_name, @continuation_contract_version, @continuation_payload);
             """,
             _connection);
         cmd.Parameters.AddWithValue("@job_id", jobId.ToString());
@@ -46,8 +78,42 @@ public sealed class MySqlJobStore : IJobStore, IDisposable
         cmd.Parameters.AddWithValue("@eligible_at", (request.EligibleAt ?? now).UtcDateTime);
         cmd.Parameters.AddWithValue("@max_attempts", request.MaxAttempts ?? 3);
         cmd.Parameters.AddWithValue("@created_at", now.UtcDateTime);
+        cmd.Parameters.AddWithValue("@idempotency_key", (object?)request.IdempotencyKey ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@idempotency_expires_at", expiresAt?.UtcDateTime ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("@recurrence_cron", (object?)request.RecurrenceCron ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@continuation_queue", (object?)request.ContinuationQueue ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@continuation_contract_name", (object?)request.ContinuationContractName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@continuation_contract_version", (object?)request.ContinuationContractVersion ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@continuation_payload", (object?)request.ContinuationPayload ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         return jobId;
+    }
+
+    private async Task<Guid?> TryGetActiveIdempotentJobIdAsync(string key, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var cmd = new MySqlCommand(
+            """
+            SELECT job_id, idempotency_expires_at, state FROM djk_jobs
+            WHERE idempotency_key = @key LIMIT 1;
+            """,
+            _connection);
+        cmd.Parameters.AddWithValue("@key", key);
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        var state = (JobState)reader.GetByte(reader.GetOrdinal("state"));
+        if (state is not (JobState.Ready or JobState.Leased))
+            return null;
+
+        var expires = reader.IsDBNull(reader.GetOrdinal("idempotency_expires_at"))
+            ? (DateTimeOffset?)null
+            : new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("idempotency_expires_at")), DateTimeKind.Utc));
+        if (expires is not null && expires <= now)
+            return null;
+
+        var jobIdValue = reader.GetValue(reader.GetOrdinal("job_id"));
+        return jobIdValue is Guid g ? g : Guid.Parse(jobIdValue.ToString()!);
     }
 
     public async Task<IReadOnlyList<ClaimedJob>> ClaimAsync(
@@ -62,7 +128,9 @@ public sealed class MySqlJobStore : IJobStore, IDisposable
 
         var claimed = new List<ClaimedJob>(maxCount);
         var queueList = string.Join(",", queues.Select((_, i) => $"@q{i}"));
-        await using var tx = await _connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        await using var tx = await _connection.BeginTransactionAsync(
+            System.Data.IsolationLevel.ReadCommitted,
+            cancellationToken).ConfigureAwait(false);
 
         for (var n = 0; n < maxCount; n++)
         {
@@ -320,16 +388,28 @@ public sealed class MySqlJobStore : IJobStore, IDisposable
         return value is DateTime dt ? new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc)) : null;
     }
 
-    public async Task<int> DeleteTerminalBatchAsync(DateTimeOffset now, int batchSize, CancellationToken cancellationToken)
+    public async Task<int> DeleteTerminalBatchAsync(
+        DateTimeOffset now,
+        JobRetentionPurge retention,
+        int batchSize,
+        CancellationToken cancellationToken)
     {
         await using var cmd = new MySqlCommand(
             """
             DELETE FROM djk_jobs WHERE job_id IN (
                 SELECT job_id FROM (
-                    SELECT job_id FROM djk_jobs WHERE state IN (2, 3, 4) AND completed_at IS NOT NULL LIMIT @batch
+                    SELECT job_id FROM djk_jobs
+                    WHERE completed_at IS NOT NULL AND (
+                        (state = 2 AND completed_at <= @success_cutoff) OR
+                        (state = 3 AND completed_at <= @failed_cutoff) OR
+                        (state = 4 AND completed_at <= @cancel_cutoff))
+                    LIMIT @batch
                 ) x);
             """,
             _connection);
+        cmd.Parameters.AddWithValue("@success_cutoff", (now - retention.SucceededRetention).UtcDateTime);
+        cmd.Parameters.AddWithValue("@failed_cutoff", (now - retention.FailedRetention).UtcDateTime);
+        cmd.Parameters.AddWithValue("@cancel_cutoff", (now - retention.CancelledRetention).UtcDateTime);
         cmd.Parameters.AddWithValue("@batch", batchSize);
         return await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

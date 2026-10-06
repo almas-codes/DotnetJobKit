@@ -14,11 +14,11 @@ public sealed class BenchJobHandler : IJobHandler<BenchJob>
 {
     public static int Completed;
 
-    public ValueTask HandleAsync(BenchJob job, JobContext context, CancellationToken cancellationToken)
+    public Task HandleAsync(BenchJob job, JobContext context, CancellationToken cancellationToken)
     {
         _ = job.Payload.Length;
         Interlocked.Increment(ref Completed);
-        return ValueTask.CompletedTask;
+        return Task.CompletedTask;
     }
 }
 
