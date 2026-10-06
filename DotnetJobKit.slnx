@@ -1,0 +1,23 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/DotnetJobKit.Benchmarks/DotnetJobKit.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/MinimalApi/MinimalApi.csproj" />
+    <Project Path="samples/Worker/Worker.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/DotnetJobKit.EntityFrameworkCore/DotnetJobKit.EntityFrameworkCore.csproj" />
+    <Project Path="src/DotnetJobKit.MySql/DotnetJobKit.MySql.csproj" />
+    <Project Path="src/DotnetJobKit.PostgreSql/DotnetJobKit.PostgreSql.csproj" />
+    <Project Path="src/DotnetJobKit.Sqlite/DotnetJobKit.Sqlite.csproj" />
+    <Project Path="src/DotnetJobKit/DotnetJobKit.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DotnetJobKit.IntegrationTests/DotnetJobKit.IntegrationTests.csproj" />
+    <Project Path="tests/DotnetJobKit.Tests/DotnetJobKit.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/DotnetJobKit.PerfRunner/DotnetJobKit.PerfRunner.csproj" />
+  </Folder>
+</Solution>

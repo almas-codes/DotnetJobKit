@@ -1,0 +1,15 @@
+[
+  {
+    "Provider": "postgres",
+    "JobCount": 1000000,
+    "Success": true,
+    "Error": null,
+    "InsertDuration": "00:00:17.4423214",
+    "InsertJobsPerSecond": 57331.81822919511,
+    "ClaimDuration": "00:00:01.3353370",
+    "ClaimedCount": 16,
+    "MemoryBeforeBytes": 44396544,
+    "MemoryAfterBytes": 44396544,
+    "CpuMilliseconds": 5234.375
+  }
+]
