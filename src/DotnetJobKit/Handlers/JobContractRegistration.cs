@@ -7,4 +7,6 @@ public sealed class JobContractRegistration
     public required string ContractName { get; init; }
     public required int ContractVersion { get; init; }
     public required string DefaultQueue { get; init; }
+
+    public JobHandleInvoker? Invoker { get; init; }
 }

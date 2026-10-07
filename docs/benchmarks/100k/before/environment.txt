@@ -1,0 +1,57 @@
+Baseline captured before execution-kernel implementation (production code unchanged at capture time).
+
+git_commit_sha=7f7b26154fad5b92e5df5a10f6e349d743f5da69
+git_branch=main
+git_status=clean (main...origin/main)
+
+dotnet_sdk=10.0.401
+dotnet_runtime=Microsoft.NETCore.App 10.0.12
+configuration=Release
+
+os=Microsoft Windows NT 10.0.26200.0
+cpu=AMD Ryzen 7 5825U with Radeon Graphics
+logical_processors=16
+ram_gb=13.8
+
+benchmark_tool=tools/DotnetJobKit.PerfRunner/Program.cs
+job_count=100000
+claim_batch_size=16
+lease_duration=TimeSpan.FromMinutes(1)  (hard-coded in PerfRunner ClaimAsync calls)
+max_concurrency=N/A (PerfRunner does not run JobRuntimeCoordinator)
+renewal_interval=N/A (PerfRunner does not run runtime)
+retention=N/A (PerfRunner insert + single claim only)
+
+sqlite_insert_batch_size=20000 (SqliteJobBulkInserter)
+postgres_insert_batch_size=10000 (PostgreSqlJobBulkInserter)
+mysql_insert_batch_size=2000 (MySqlJobBulkInserter)
+
+postgres_connection_default=Host=localhost;Port=5432;Username=postgres;Password=admin;Database=postgres
+postgres_benchmark_database=dotnetjobkit_perf (created by PerfRunner if missing)
+postgres_env_override=DOTNETJOBKIT_PG_CONNECTION (not set during baseline capture; defaults used)
+
+mysql_connection_default=Server=localhost;Port=3306;Database=Adastra_QA;User=admin;Password=admin
+mysql_env_override=DOTNETJOBKIT_MYSQL_CONNECTION (not set during baseline capture; defaults used)
+
+sqlite=temp file per run under Path.GetTempPath(), deleted after run
+
+postgresql_server_version=NOT CAPTURED (psql not invoked in baseline script)
+mysql_server_version=NOT CAPTURED
+sqlite_version=Microsoft.Data.Sqlite (bundled with driver; exact lib version NOT CAPTURED)
+
+warmup_runs=1 per provider (sqlite-warmup.txt, postgres-warmup.txt, mysql-warmup.txt)
+measured_runs=3 per provider (sqlite-run-1..3, postgres-run-1..3, mysql-run-1..3)
+
+solution_build_note=Full solution build fails on samples/MinimalApi/Program.cs CS0841; PerfRunner and test projects build successfully.
+
+tests_before_implementation:
+  unit: 4 passed, 0 failed (docs/benchmarks/100k/before/tests-unit.txt)
+  integration (filtered): 27 passed, 0 failed (docs/benchmarks/100k/before/tests-integration.txt)
+  combined: docs/benchmarks/100k/before/tests.txt
+
+metrics_not_provided_by_perf_runner:
+  - runtime total completion duration
+  - retry/failure/cancellation counts during benchmark
+  - allocation/GC detail (only process WorkingSet and TotalProcessorTime delta)
+  - SQL command count / DB round trips
+  - lease renew / cancellation poll counts
+  - scheduler wake counts

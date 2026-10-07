@@ -1,0 +1,3 @@
+﻿DotnetJobKit PerfRunner ΓÇö jobs=100,000, providers=[sqlite]
+[sqlite] insert 2.5s (40,052 jobs/s) | claim16 61.5ms | WS 28 MB
+Report written (jobs=100,000)

@@ -1,5 +1,6 @@
 using DotnetJobKit.Abstractions;
 using DotnetJobKit.Configuration;
+using DotnetJobKit.Diagnostics;
 using Microsoft.Extensions.Options;
 using Npgsql;
 
@@ -7,19 +8,20 @@ namespace DotnetJobKit.PostgreSql;
 
 public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
 {
-    private readonly NpgsqlConnection _connection;
     private readonly PostgreSqlJobStoreOptions _options;
 
     public PostgreSqlJobStore(IOptions<PostgreSqlJobStoreOptions> options)
     {
         _options = options.Value;
-        var csb = new NpgsqlConnectionStringBuilder(_options.ConnectionString) { CommandTimeout = 0 };
-        _connection = new NpgsqlConnection(csb.ConnectionString);
-        _connection.Open();
-        EnsureSchema(_connection);
+        var csb = new NpgsqlConnectionStringBuilder(_options.ConnectionString)
+        {
+            CommandTimeout = 0,
+            Pooling = true,
+        };
+        _dataSource = NpgsqlDataSource.Create(csb.ConnectionString);
+        using var bootstrap = _dataSource.OpenConnection();
+        EnsureSchema(bootstrap);
     }
-
-    public NpgsqlConnection Connection => _connection;
 
     public static void EnsureSchema(NpgsqlConnection connection)
     {
@@ -27,6 +29,8 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
         cmd.CommandText = PostgreSqlSchema.CreateTable;
         cmd.ExecuteNonQuery();
         cmd.CommandText = PostgreSqlSchema.CreateDispatchIndex;
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = PostgreSqlSchema.CreateActiveIdempotencyIndex;
         cmd.ExecuteNonQuery();
         EnsureExtendedColumns(connection);
     }
@@ -46,15 +50,105 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
 
     public async Task<Guid> SubmitAsync(JobSubmitRequest request, DateTimeOffset now, CancellationToken cancellationToken)
     {
-        if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
-        {
-            var existing = await TryGetActiveIdempotentJobIdAsync(request.IdempotencyKey, now, cancellationToken).ConfigureAwait(false);
-            if (existing is not null)
-                return existing.Value;
-        }
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(request.IdempotencyKey))
+            return await InsertJobAsync(connection, null, request, now, Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
+
+        await using var tx = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        await ClearExpiredIdempotencyKeyAsync(connection, tx, request.IdempotencyKey, now, cancellationToken).ConfigureAwait(false);
 
         var jobId = Guid.NewGuid();
-        var expiresAt = request.IdempotencyTtl is { } ttl ? now + ttl : (DateTimeOffset?)null;
+        await using var insert = new NpgsqlCommand(
+            """
+            INSERT INTO djk_jobs (
+                job_id, queue, contract_name, contract_version, payload, state, eligible_at,
+                attempt_count, max_attempts, cancellation_requested, created_at,
+                idempotency_key, idempotency_expires_at,
+                recurrence_cron, continuation_queue, continuation_contract_name, continuation_contract_version, continuation_payload)
+            VALUES (
+                @job_id, @queue, @contract_name, @contract_version, @payload, @state, @eligible_at,
+                0, @max_attempts, false, @created_at,
+                @idempotency_key, @idempotency_expires_at,
+                @recurrence_cron, @continuation_queue, @continuation_contract_name, @continuation_contract_version, @continuation_payload)
+            ON CONFLICT (idempotency_key) WHERE (idempotency_key IS NOT NULL AND state IN (0, 1))
+            DO NOTHING
+            RETURNING job_id;
+            """,
+            connection,
+            tx);
+        BindSubmitParameters(insert, jobId, request, now);
+        JobStoreDiagnostics.RecordCommand();
+        var inserted = await insert.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        if (inserted is Guid created)
+        {
+            await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return created;
+        }
+
+        var existing = await ReadActiveIdempotentJobIdInTransactionAsync(
+            connection,
+            tx,
+            request.IdempotencyKey,
+            now,
+            cancellationToken).ConfigureAwait(false);
+        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+        if (existing is null)
+            throw new InvalidOperationException("Idempotent submit failed to resolve an active job id.");
+        return existing.Value;
+    }
+
+    private static async Task ClearExpiredIdempotencyKeyAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction tx,
+        string key,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        await using var cmd = new NpgsqlCommand(
+            """
+            UPDATE djk_jobs SET idempotency_key = NULL, idempotency_expires_at = NULL
+            WHERE idempotency_key = @key AND state IN (0, 1)
+              AND idempotency_expires_at IS NOT NULL AND idempotency_expires_at <= @now;
+            """,
+            connection,
+            tx);
+        cmd.Parameters.AddWithValue("key", key);
+        cmd.Parameters.AddWithValue("now", now);
+        JobStoreDiagnostics.RecordCommand();
+        await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<Guid?> ReadActiveIdempotentJobIdInTransactionAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction tx,
+        string key,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        await using var cmd = new NpgsqlCommand(
+            """
+            SELECT job_id FROM djk_jobs
+            WHERE idempotency_key = @key AND state IN (0, 1)
+              AND (idempotency_expires_at IS NULL OR idempotency_expires_at > @now)
+            LIMIT 1;
+            """,
+            connection,
+            tx);
+        cmd.Parameters.AddWithValue("key", key);
+        cmd.Parameters.AddWithValue("now", now);
+        JobStoreDiagnostics.RecordCommand();
+        var value = await cmd.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return value is Guid id ? id : null;
+    }
+
+    private static async Task<Guid> InsertJobAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction? tx,
+        JobSubmitRequest request,
+        DateTimeOffset now,
+        Guid jobId,
+        CancellationToken cancellationToken)
+    {
         await using var cmd = new NpgsqlCommand(
             """
             INSERT INTO djk_jobs (
@@ -68,7 +162,17 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
                 @idempotency_key, @idempotency_expires_at,
                 @recurrence_cron, @continuation_queue, @continuation_contract_name, @continuation_contract_version, @continuation_payload);
             """,
-            _connection);
+            connection,
+            tx);
+        BindSubmitParameters(cmd, jobId, request, now);
+        JobStoreDiagnostics.RecordCommand();
+        await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return jobId;
+    }
+
+    private static void BindSubmitParameters(NpgsqlCommand cmd, Guid jobId, JobSubmitRequest request, DateTimeOffset now)
+    {
+        var expiresAt = request.IdempotencyTtl is { } ttl ? now + ttl : (DateTimeOffset?)null;
         cmd.Parameters.AddWithValue("job_id", jobId);
         cmd.Parameters.AddWithValue("queue", request.Queue);
         cmd.Parameters.AddWithValue("contract_name", request.ContractName);
@@ -85,18 +189,20 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
         cmd.Parameters.AddWithValue("continuation_contract_name", (object?)request.ContinuationContractName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("continuation_contract_version", (object?)request.ContinuationContractVersion ?? DBNull.Value);
         cmd.Parameters.AddWithValue("continuation_payload", (object?)request.ContinuationPayload ?? DBNull.Value);
-        await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        return jobId;
     }
 
-    private async Task<Guid?> TryGetActiveIdempotentJobIdAsync(string key, DateTimeOffset now, CancellationToken cancellationToken)
+    private async Task<Guid?> TryGetActiveIdempotentJobIdAsync(
+        NpgsqlConnection connection,
+        string key,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
     {
         await using var cmd = new NpgsqlCommand(
             """
             SELECT job_id, idempotency_expires_at, state FROM djk_jobs
             WHERE idempotency_key = @key LIMIT 1;
             """,
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("key", key);
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -125,91 +231,21 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
         if (maxCount <= 0 || queues.Count == 0)
             return Array.Empty<ClaimedJob>();
 
-        var leaseExpiresAt = now + leaseDuration;
-        var useLeaseToken = _options.OwnershipFencing == OwnershipFencingMode.LeaseToken;
-        var claimed = new List<ClaimedJob>(maxCount);
-        await using var tx = await _connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-
-        await using (var dead = new NpgsqlCommand(
-            """
-            UPDATE djk_jobs SET state = 3, eligible_at = NULL, completed_at = @now,
-                last_error = COALESCE(last_error, 'Max attempts exhausted after lease expiration.')
-            WHERE queue = ANY(@queues) AND state = 1 AND attempt_count >= max_attempts
-              AND eligible_at IS NOT NULL AND eligible_at <= @now;
-            """,
-            _connection,
-            tx))
-        {
-            dead.Parameters.AddWithValue("queues", queues.ToArray());
-            dead.Parameters.AddWithValue("now", now);
-            await dead.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        await using var claim = new NpgsqlCommand(
-            """
-            WITH picked AS (
-                SELECT job_id, queue, contract_name, contract_version, payload, attempt_count, max_attempts, cancellation_requested
-                FROM djk_jobs
-                WHERE queue = ANY(@queues)
-                  AND state IN (0, 1)
-                  AND eligible_at IS NOT NULL
-                  AND eligible_at <= @now
-                  AND NOT (state = 1 AND attempt_count >= max_attempts)
-                ORDER BY eligible_at, job_id
-                FOR UPDATE SKIP LOCKED
-                LIMIT @max_count
-            )
-            UPDATE djk_jobs AS j
-            SET state = 1,
-                attempt_count = picked.attempt_count + 1,
-                eligible_at = @lease_expires,
-                lease_token = CASE WHEN @use_token THEN gen_random_uuid() ELSE NULL END
-            FROM picked
-            WHERE j.job_id = picked.job_id
-            RETURNING j.job_id, picked.queue, picked.contract_name, picked.contract_version, picked.payload,
-                      j.attempt_count, picked.max_attempts, picked.cancellation_requested, j.lease_token;
-            """,
-            _connection,
-            tx);
-        claim.Parameters.AddWithValue("queues", queues.ToArray());
-        claim.Parameters.AddWithValue("now", now);
-        claim.Parameters.AddWithValue("max_count", maxCount);
-        claim.Parameters.AddWithValue("lease_expires", leaseExpiresAt);
-        claim.Parameters.AddWithValue("use_token", useLeaseToken);
-
-        await using (var reader = await claim.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
-        {
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                claimed.Add(new ClaimedJob
-                {
-                    JobId = reader.GetGuid(0),
-                    Queue = reader.GetString(1),
-                    ContractName = reader.GetString(2),
-                    ContractVersion = reader.GetInt32(3),
-                    Payload = reader.GetString(4),
-                    AttemptCount = reader.GetInt32(5),
-                    MaxAttempts = reader.GetInt32(6),
-                    CancellationRequested = reader.GetBoolean(7),
-                    LeaseExpiresAt = leaseExpiresAt,
-                    LeaseToken = reader.IsDBNull(8) ? null : reader.GetGuid(8),
-                });
-            }
-        }
-
-        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return claimed;
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        return await ClaimOnConnectionAsync(connection, queues, maxCount, now, leaseDuration, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async Task<bool> RenewAsync(Guid jobId, int attemptCount, Guid? leaseToken, DateTimeOffset leaseExpiresAt, CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             """
             UPDATE djk_jobs SET eligible_at = @lease_expires
             WHERE job_id = @job_id AND state = 1 AND attempt_count = @attempt_count
               AND (@lease_token IS NULL OR lease_token = @lease_token);
             """,
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
         cmd.Parameters.AddWithValue("attempt_count", attemptCount);
         cmd.Parameters.AddWithValue("lease_expires", leaseExpiresAt);
@@ -219,13 +255,14 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
 
     public async Task<bool> IsCancellationRequestedAsync(Guid jobId, int attemptCount, Guid? leaseToken, CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             """
             SELECT cancellation_requested FROM djk_jobs
             WHERE job_id = @job_id AND state = 1 AND attempt_count = @attempt_count
               AND (@lease_token IS NULL OR lease_token = @lease_token);
             """,
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
         cmd.Parameters.AddWithValue("attempt_count", attemptCount);
         cmd.Parameters.AddWithValue("lease_token", (object?)leaseToken ?? DBNull.Value);
@@ -235,6 +272,7 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
 
     public async Task<bool> SettleAsync(SettleRequest request, CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         if (request.Outcome == SettleOutcome.Succeeded && request.DeleteOnSuccess)
         {
             await using var delete = new NpgsqlCommand(
@@ -242,7 +280,7 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
                 DELETE FROM djk_jobs WHERE job_id = @job_id AND state = 1 AND attempt_count = @attempt_count
                   AND (@lease_token IS NULL OR lease_token = @lease_token);
                 """,
-                _connection);
+                connection);
             delete.Parameters.AddWithValue("job_id", request.JobId);
             delete.Parameters.AddWithValue("attempt_count", request.AttemptCount);
             delete.Parameters.AddWithValue("lease_token", (object?)request.LeaseToken ?? DBNull.Value);
@@ -289,7 +327,7 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
             WHERE job_id = @job_id AND state = 1 AND attempt_count = @attempt_count
               AND (@lease_token IS NULL OR lease_token = @lease_token);
             """,
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("state", state);
         cmd.Parameters.AddWithValue("eligible_at", (object?)eligibleAt ?? DBNull.Value);
         cmd.Parameters.AddWithValue("completed_at", (object?)completedAt ?? DBNull.Value);
@@ -302,9 +340,10 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
 
     public async Task<bool> CancelReadyAsync(Guid jobId, DateTimeOffset now, CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             "UPDATE djk_jobs SET state = 4, eligible_at = NULL, completed_at = @now WHERE job_id = @job_id AND state = 0;",
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
         cmd.Parameters.AddWithValue("now", now);
         return await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
@@ -312,16 +351,18 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
 
     public async Task<bool> RequestLeasedCancellationAsync(Guid jobId, CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             "UPDATE djk_jobs SET cancellation_requested = true WHERE job_id = @job_id AND state = 1;",
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
         return await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
     public async Task<JobRecord?> GetAsync(Guid jobId, CancellationToken cancellationToken)
     {
-        await using var cmd = new NpgsqlCommand("SELECT * FROM djk_jobs WHERE job_id = @job_id LIMIT 1;", _connection);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand("SELECT * FROM djk_jobs WHERE job_id = @job_id LIMIT 1;", connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadRecord(reader) : null;
@@ -332,12 +373,13 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
         if (queues.Count == 0)
             return null;
 
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             """
             SELECT MIN(eligible_at) FROM djk_jobs
             WHERE queue = ANY(@queues) AND state IN (0, 1) AND eligible_at IS NOT NULL;
             """,
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("queues", queues.ToArray());
         var value = await cmd.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return value is DateTimeOffset dto ? dto : null;
@@ -349,6 +391,7 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
         int batchSize,
         CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             """
             DELETE FROM djk_jobs WHERE job_id IN (
@@ -359,7 +402,7 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
                     (state = 4 AND completed_at <= @cancel_cutoff))
                 LIMIT @batch);
             """,
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("success_cutoff", now - retention.SucceededRetention);
         cmd.Parameters.AddWithValue("failed_cutoff", now - retention.FailedRetention);
         cmd.Parameters.AddWithValue("cancel_cutoff", now - retention.CancelledRetention);
@@ -409,5 +452,5 @@ public sealed partial class PostgreSqlJobStore : IJobStore, IDisposable
         return reader.IsDBNull(ordinal) ? null : reader.GetFieldValue<DateTimeOffset>(ordinal);
     }
 
-    public void Dispose() => _connection.Dispose();
+    public void Dispose() => _dataSource.Dispose();
 }

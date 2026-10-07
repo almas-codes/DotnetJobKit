@@ -1,15 +1,15 @@
 [
   {
-    "Provider": "postgres",
-    "JobCount": 1000000,
+    "Provider": "mysql",
+    "JobCount": 100000,
     "Success": true,
     "Error": null,
-    "InsertDuration": "00:00:17.4423214",
-    "InsertJobsPerSecond": 57331.81822919511,
-    "ClaimDuration": "00:00:01.3353370",
+    "InsertDuration": "00:01:17.0891397",
+    "InsertJobsPerSecond": 1297.1995846517405,
+    "ClaimDuration": "00:00:00.1234547",
     "ClaimedCount": 16,
-    "MemoryBeforeBytes": 44396544,
-    "MemoryAfterBytes": 44396544,
-    "CpuMilliseconds": 5234.375
+    "MemoryBeforeBytes": 53063680,
+    "MemoryAfterBytes": 53063680,
+    "CpuMilliseconds": 32359.375
   }
 ]

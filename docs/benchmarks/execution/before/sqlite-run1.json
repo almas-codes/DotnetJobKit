@@ -1,0 +1,12 @@
+{
+  "Provider": "sqlite",
+  "Run": 1,
+  "JobsSubmitted": 10000,
+  "MaxConcurrency": 32,
+  "JobsSucceeded": 10000,
+  "ElapsedSeconds": 1566.5637968,
+  "JobsPerSecond": 6.383397867630333,
+  "RssBeforeBytes": 26341376,
+  "RssAfterBytes": 26341376,
+  "CpuMs": 12578.125
+}

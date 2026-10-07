@@ -22,7 +22,8 @@ internal static class MySqlSchema
             idempotency_key VARCHAR(256) NULL,
             idempotency_expires_at DATETIME(6) NULL,
             lease_token CHAR(36) NULL,
-            INDEX ix_djk_dispatch (queue, eligible_at, job_id)
+            INDEX ix_djk_dispatch (queue, eligible_at, job_id),
+            UNIQUE INDEX ux_djk_active_idempotency (idempotency_key, state)
         );
         """;
 }

@@ -11,6 +11,28 @@ public interface IJobStore
         TimeSpan leaseDuration,
         CancellationToken cancellationToken);
 
+    Task<ClaimBatchResult> ClaimBatchAsync(
+        IReadOnlyList<string> queues,
+        int maxCount,
+        DateTimeOffset now,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken);
+
+    Task<IReadOnlyList<LeaseMaintenanceResult>> MaintainLeasesAsync(
+        IReadOnlyList<LeaseMaintenanceRequest> requests,
+        CancellationToken cancellationToken);
+
+    Task<CommitOutcomeResult> CommitOutcomeAsync(
+        CommitOutcomeRequest request,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    Task<int> RecoverExhaustedLeasesBatchAsync(
+        IReadOnlyList<string> queues,
+        int batchSize,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
     Task<bool> RenewAsync(
         Guid jobId,
         int attemptCount,

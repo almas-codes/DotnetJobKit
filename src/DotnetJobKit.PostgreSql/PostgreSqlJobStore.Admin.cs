@@ -8,7 +8,8 @@ public sealed partial class PostgreSqlJobStore
     public async Task<IReadOnlyDictionary<JobState, int>> GetCountsByStateAsync(CancellationToken cancellationToken)
     {
         var counts = Enum.GetValues<JobState>().ToDictionary(s => s, _ => 0);
-        await using var cmd = new NpgsqlCommand("SELECT state, COUNT(*) FROM djk_jobs GROUP BY state;", _connection);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand("SELECT state, COUNT(*) FROM djk_jobs GROUP BY state;", connection);
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             counts[(JobState)reader.GetInt16(0)] = reader.GetInt32(1);
@@ -22,7 +23,8 @@ public sealed partial class PostgreSqlJobStore
         CancellationToken cancellationToken)
     {
         var filters = new List<string>();
-        await using var cmd = new NpgsqlCommand { Connection = _connection };
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand { Connection = connection };
         if (state is not null)
         {
             filters.Add("state = @state");
@@ -51,13 +53,14 @@ public sealed partial class PostgreSqlJobStore
 
     public async Task<bool> RequeueDeadAsync(Guid jobId, DateTimeOffset now, CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             """
             UPDATE djk_jobs SET state = 0, eligible_at = @now, attempt_count = 0, completed_at = NULL,
                 last_error = NULL, lease_token = NULL, cancellation_requested = false
             WHERE job_id = @job_id AND state = 3;
             """,
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
         cmd.Parameters.AddWithValue("now", now);
         return await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
@@ -65,9 +68,10 @@ public sealed partial class PostgreSqlJobStore
 
     public async Task<bool> DeleteTerminalJobAsync(Guid jobId, CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             "DELETE FROM djk_jobs WHERE job_id = @job_id AND state IN (2, 3, 4);",
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
         return await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
@@ -80,6 +84,7 @@ public sealed partial class PostgreSqlJobStore
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             """
             UPDATE djk_jobs SET state = 0, attempt_count = 0, eligible_at = @next_eligible, completed_at = NULL,
@@ -87,7 +92,7 @@ public sealed partial class PostgreSqlJobStore
             WHERE job_id = @job_id AND state = 1 AND attempt_count = @attempt_count
               AND (@lease_token IS NULL OR lease_token = @lease_token);
             """,
-            _connection);
+            connection);
         cmd.Parameters.AddWithValue("job_id", jobId);
         cmd.Parameters.AddWithValue("attempt_count", attemptCount);
         cmd.Parameters.AddWithValue("lease_token", (object?)leaseToken ?? DBNull.Value);

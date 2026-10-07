@@ -1,0 +1,1 @@
+﻿DotnetJobKit PerfRunner ΓÇö jobs=100,000, providers=[mysql]

@@ -2,6 +2,7 @@ using DotnetJobKit.Abstractions;
 using DotnetJobKit.Client;
 using DotnetJobKit.Configuration;
 using DotnetJobKit.Handlers;
+using DotnetJobKit.Execution;
 using DotnetJobKit.Runtime;
 using DotnetJobKit.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -29,7 +30,9 @@ public static class ServiceCollectionExtensions
         });
 
         services.TryAddSingleton<IJobSubmitter, JobSubmitter>();
+        services.AddSingleton<JobExecutionKernel>();
         services.AddHostedService<JobRuntimeCoordinator>();
+        services.AddHostedService<RetentionMaintenanceService>();
         return services;
     }
 
@@ -59,6 +62,7 @@ public static class ServiceCollectionExtensions
             ContractName = contract,
             ContractVersion = contractVersion,
             DefaultQueue = queue,
+            Invoker = JobHandleInvokerFactory.Create(typeof(TJob)),
         });
 
         services.AddScoped<THandler>();

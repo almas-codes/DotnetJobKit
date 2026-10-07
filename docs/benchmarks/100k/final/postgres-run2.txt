@@ -1,0 +1,4 @@
+﻿DotnetJobKit PerfRunner ΓÇö jobs=100,000, providers=[postgres]
+[postgres bulk] 100,000 / 100,000 rows
+[postgres] insert 2.4s (41,313 jobs/s) | claim16 588.4ms | WS 42 MB
+Report written (jobs=100,000)

@@ -30,8 +30,8 @@ internal static class SqliteSchema
         """;
 
     public const string CreateIdempotencyIndex = """
-        CREATE UNIQUE INDEX IF NOT EXISTS IX_Jobs_IdempotencyKey
+        CREATE UNIQUE INDEX IF NOT EXISTS IX_Jobs_ActiveIdempotencyKey
         ON Jobs (IdempotencyKey)
-        WHERE IdempotencyKey IS NOT NULL;
+        WHERE IdempotencyKey IS NOT NULL AND State IN (0, 1);
         """;
 }

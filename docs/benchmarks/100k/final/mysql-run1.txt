@@ -1,0 +1,3 @@
+﻿DotnetJobKit PerfRunner ΓÇö jobs=100,000, providers=[mysql]
+[mysql] insert 69.9s (1,430 jobs/s) | claim16 127.4ms | WS 50 MB
+Report written (jobs=100,000)

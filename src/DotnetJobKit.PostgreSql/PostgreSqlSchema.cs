@@ -30,4 +30,10 @@ internal static class PostgreSqlSchema
         ON djk_jobs (queue, eligible_at, job_id)
         WHERE state IN (0, 1);
         """;
+
+    public const string CreateActiveIdempotencyIndex = """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_djk_jobs_active_idempotency
+        ON djk_jobs (idempotency_key)
+        WHERE idempotency_key IS NOT NULL AND state IN (0, 1);
+        """;
 }

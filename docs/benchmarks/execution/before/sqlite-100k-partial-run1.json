@@ -1,0 +1,13 @@
+{
+  "Provider": "sqlite",
+  "Run": 1,
+  "JobsSubmitted": 100000,
+  "MaxConcurrency": 32,
+  "JobsSucceeded": 11491,
+  "ElapsedSeconds": 1800.2585673,
+  "JobsPerSecond": 55.547576229551545,
+  "RssBeforeBytes": 27299840,
+  "RssAfterBytes": 27299840,
+  "CpuMs": 25671.875,
+  "Note": "30-minute ExecutionPerfRunner cap; superseded on disk by 10K run using same sqlite-run1.json filename — preserved here."
+}

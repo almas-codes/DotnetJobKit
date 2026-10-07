@@ -16,7 +16,10 @@ public static class SqliteJobBulkInserter
         int maxAttempts,
         int batchSize = 10_000,
         IProgress<long>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? continuationContractName = null,
+        string? continuationPayload = null,
+        string continuationQueue = "default")
     {
         if (count <= 0)
             return;
@@ -34,7 +37,19 @@ public static class SqliteJobBulkInserter
         var eligible = eligibleAt.ToString("O");
 
         await using var insert = connection.CreateCommand();
-        insert.CommandText = """
+        var withContinuation = !string.IsNullOrWhiteSpace(continuationContractName);
+        insert.CommandText = withContinuation
+            ? """
+            INSERT INTO Jobs (
+                JobId, Queue, ContractName, ContractVersion, Payload, State, EligibleAt,
+                AttemptCount, MaxAttempts, CancellationRequested, CreatedAt, CompletedAt, LastError,
+                IdempotencyKey, IdempotencyExpiresAt, LeaseToken,
+                ContinuationQueue, ContinuationContractName, ContinuationContractVersion, ContinuationPayload)
+            VALUES ($jobId, $queue, $contractName, $contractVersion, $payload, $state, $eligibleAt,
+                0, $maxAttempts, 0, $createdAt, NULL, NULL, NULL, NULL, NULL,
+                $continuationQueue, $continuationContractName, 1, $continuationPayload);
+            """
+            : """
             INSERT INTO Jobs (
                 JobId, Queue, ContractName, ContractVersion, Payload, State, EligibleAt,
                 AttemptCount, MaxAttempts, CancellationRequested, CreatedAt, CompletedAt, LastError,
@@ -61,6 +76,12 @@ public static class SqliteJobBulkInserter
         pEligible.Value = eligible;
         pMax.Value = maxAttempts;
         pCreated.Value = now;
+        if (withContinuation)
+        {
+            insert.Parameters.Add("$continuationQueue", SqliteType.Text).Value = continuationQueue;
+            insert.Parameters.Add("$continuationContractName", SqliteType.Text).Value = continuationContractName!;
+            insert.Parameters.Add("$continuationPayload", SqliteType.Text).Value = continuationPayload ?? "{}";
+        }
 
         while (inserted < count)
         {

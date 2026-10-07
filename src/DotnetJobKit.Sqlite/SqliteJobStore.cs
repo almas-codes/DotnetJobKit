@@ -1,6 +1,7 @@
 using System.Data.Common;
 using DotnetJobKit.Abstractions;
 using DotnetJobKit.Configuration;
+using DotnetJobKit.Diagnostics;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Options;
 
@@ -401,16 +402,56 @@ public sealed partial class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyn
         {
             if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
             {
-                var existing = await ReadIdempotentJobIdAsync(connection, transaction, request.IdempotencyKey, now, cancellationToken)
+                await using var tx = transaction is null
+                    ? await SqliteImmediateTransaction.BeginAsync((SqliteConnection)connection, _options.UseBeginImmediate, cancellationToken).ConfigureAwait(false)
+                    : null;
+                var activeTx = transaction ?? tx?.Transaction;
+
+                await ClearExpiredIdempotencyKeyAsync(connection, activeTx, request.IdempotencyKey, now, cancellationToken)
                     .ConfigureAwait(false);
-                if (existing is not null)
-                    return existing.Value;
+
+                var jobId = Guid.NewGuid();
+                await using var insert = connection.CreateCommand();
+                insert.Transaction = activeTx;
+                insert.CommandText = """
+                    INSERT INTO Jobs (
+                        JobId, Queue, ContractName, ContractVersion, Payload, State, EligibleAt,
+                        AttemptCount, MaxAttempts, CancellationRequested, CreatedAt, CompletedAt, LastError,
+                        IdempotencyKey, IdempotencyExpiresAt, LeaseToken,
+                        RecurrenceCron, ContinuationQueue, ContinuationContractName, ContinuationContractVersion, ContinuationPayload)
+                    VALUES (
+                        $jobId, $queue, $contractName, $contractVersion, $payload, $state, $eligibleAt,
+                        $attemptCount, $maxAttempts, $cancellationRequested, $createdAt, NULL, NULL,
+                        $idempotencyKey, $idempotencyExpiresAt, NULL,
+                        $recurrenceCron, $continuationQueue, $continuationContractName, $continuationContractVersion, $continuationPayload)
+                    ON CONFLICT(IdempotencyKey) WHERE IdempotencyKey IS NOT NULL AND State IN (0, 1)
+                    DO NOTHING
+                    RETURNING JobId;
+                    """;
+                BindSubmit(insert, jobId, request, request.EligibleAt ?? now, request.MaxAttempts ?? 3, now,
+                    request.IdempotencyTtl is { } ttl ? now + ttl : null);
+                JobStoreDiagnostics.RecordCommand();
+                var inserted = await insert.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+                if (inserted is string created && Guid.TryParse(created, out var createdId))
+                {
+                    if (tx is not null)
+                        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    return createdId;
+                }
+
+                var existing = await ReadActiveIdempotentJobIdAsync(connection, activeTx, request.IdempotencyKey, now, cancellationToken)
+                    .ConfigureAwait(false);
+                if (tx is not null)
+                    await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+                if (existing is null)
+                    throw new InvalidOperationException("Idempotent submit failed to resolve an active job id.");
+                return existing.Value;
             }
 
-            var jobId = Guid.NewGuid();
+            var newJobId = Guid.NewGuid();
             var eligibleAt = request.EligibleAt ?? now;
             var maxAttempts = request.MaxAttempts ?? 3;
-            var expiresAt = request.IdempotencyTtl is { } ttl ? now + ttl : (DateTimeOffset?)null;
+            var expiresAt = request.IdempotencyTtl is { } ttl2 ? now + ttl2 : (DateTimeOffset?)null;
 
             await using var cmd = connection.CreateCommand();
             if (transaction is not null)
@@ -428,9 +469,10 @@ public sealed partial class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyn
                     $idempotencyKey, $idempotencyExpiresAt, NULL,
                     $recurrenceCron, $continuationQueue, $continuationContractName, $continuationContractVersion, $continuationPayload);
                 """;
-            BindSubmit(cmd, jobId, request, eligibleAt, maxAttempts, now, expiresAt);
+            BindSubmit(cmd, newJobId, request, eligibleAt, maxAttempts, now, expiresAt);
+            JobStoreDiagnostics.RecordCommand();
             await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            return jobId;
+            return newJobId;
         }
         finally
         {
@@ -532,6 +574,35 @@ public sealed partial class SqliteJobStore : IJobStore, IEnlistedJobStore, IAsyn
         p.ParameterName = name;
         p.Value = value;
         cmd.Parameters.Add(p);
+    }
+
+    private static Task<Guid?> ReadActiveIdempotentJobIdAsync(
+        DbConnection connection,
+        DbTransaction? transaction,
+        string key,
+        DateTimeOffset now,
+        CancellationToken cancellationToken) =>
+        ReadIdempotentJobIdAsync(connection, transaction, key, now, cancellationToken);
+
+    private static async Task ClearExpiredIdempotencyKeyAsync(
+        DbConnection connection,
+        DbTransaction? transaction,
+        string key,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        await using var cmd = connection.CreateCommand();
+        if (transaction is not null)
+            cmd.Transaction = transaction;
+        cmd.CommandText = """
+            UPDATE Jobs SET IdempotencyKey = NULL, IdempotencyExpiresAt = NULL
+            WHERE IdempotencyKey = $key AND State IN (0, 1)
+              AND IdempotencyExpiresAt IS NOT NULL AND IdempotencyExpiresAt <= $now;
+            """;
+        AddParam(cmd, "$key", key);
+        AddParam(cmd, "$now", now.ToString("O"));
+        JobStoreDiagnostics.RecordCommand();
+        await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<Guid?> ReadIdempotentJobIdAsync(

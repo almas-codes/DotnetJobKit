@@ -5,3 +5,4 @@ obj/
 *.db-wal
 *.db-shm
 .vs/
+docs/benchmarks/environment.local.ps1

@@ -1,0 +1,7 @@
+[2026-10-07T16:44:04.8577055+05:00] === 100K PerfRunner postgres/mysql x3 ===
+[2026-10-07T16:44:04.9070279+05:00] PerfRunner postgres run 1
+[2026-10-07T16:44:12.1761816+05:00] PerfRunner postgres run 2
+[2026-10-07T16:44:18.3593748+05:00] PerfRunner postgres run 3
+[2026-10-07T16:44:24.5177939+05:00] PerfRunner mysql run 1
+[2026-10-07T16:45:37.9246122+05:00] PerfRunner mysql run 2
+[2026-10-07T16:46:58.2215198+05:00] PerfRunner mysql run 3

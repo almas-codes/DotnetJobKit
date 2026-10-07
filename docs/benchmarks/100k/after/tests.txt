@@ -1,0 +1,8 @@
+Test run for D:\add-astra-max\github projects\DotnetJobKit\tests\DotnetJobKit.Tests\bin\Release\net10.0\DotnetJobKit.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+
+Passed!  - Failed:     0, Passed:     4, Skipped:     0, Total:     4, Duration: 74 ms - DotnetJobKit.Tests.dll (net10.0)
+Test run for D:\add-astra-max\github projects\DotnetJobKit\tests\DotnetJobKit.IntegrationTests\bin\Release\net10.0\DotnetJobKit.IntegrationTests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+
+Passed!  - Failed:     0, Passed:    27, Skipped:     0, Total:    27, Duration: 16 s - DotnetJobKit.IntegrationTests.dll (net10.0)

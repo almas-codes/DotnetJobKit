@@ -4,7 +4,7 @@ using Microsoft.Extensions.Options;
 
 namespace DotnetJobKit.Storage;
 
-public sealed class InMemoryJobStore : IJobStore
+public sealed partial class InMemoryJobStore : IJobStore
 {
     private readonly object _sync = new();
     private readonly Dictionary<Guid, MutableJob> _jobs = new();
